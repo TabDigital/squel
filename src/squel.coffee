@@ -66,7 +66,7 @@ cls.DefaultQueryBuilderOptions =
   valueHandlers: []
   # Number parameters returned from toParam() as $1, $2, etc. Default is to use '?', startAt 1 will give $1...
   numberedParameters: false
-  #numberedParametersStartAt: undefined
+  numberedParametersStartAt: 1
   # If true then replaces all single quotes within strings. The replacement string used is configurable via the `singleQuoteReplacement` option.
   replaceSingleQuotes: false
   # The string to replace single quotes with in query strings
@@ -266,7 +266,10 @@ class cls.BaseBuilder extends cls.Cloneable
       value.map (v) => @_formatValueAsParam v
     else
       if value instanceof cls.QueryBuilder and value.isNestable()
-        "#{value}"
+        value.updateOptions( { "nestedBuilder": true } )
+        p = value.toParam()
+      else if value instanceof cls.Expression
+        p = value.toParam()
       else
         @_formatCustomValue(value)
 
@@ -284,6 +287,8 @@ class cls.BaseBuilder extends cls.Cloneable
       else if "boolean" is typeof value
         value = if value then "TRUE" else "FALSE"
       else if value instanceof cls.QueryBuilder
+        value = "(#{value})"
+      else if value instanceof cls.Expression
         value = "(#{value})"
       else if "number" isnt typeof value
         value = @_escapeValue(value)
@@ -406,7 +411,12 @@ class cls.Expression extends cls.BaseBuilder
                   if not paramMode
                     nodeStr = nodeStr.replace '?', @_formatValue(child.para)
                   else
-                    params = params.concat(@_formatValueAsParam child.para)
+                    cv = @_formatValueAsParam child.para
+                    if (cv.text?)
+                      params = params.concat(cv.values)
+                      nodeStr = nodeStr.replace '?', "(#{cv.text})"
+                    else
+                      params = params.concat(cv)
                     # IN ? -> IN (?, ?, ..., ?)
                     if Array.isArray(child.para)
                       inStr = Array.apply(null, new Array(child.para.length)).map () -> '?'
@@ -564,13 +574,61 @@ class cls.AbstractTableBlock extends cls.Block
 
     tables
 
+  _buildParam: (queryBuilder, prefix = null) ->
+    ret =
+      text: ""
+      values: []
+
+    params = []
+    paramStr = ""
+
+    if 0 >= @tables.length then return ret
+
+    # retrieve the parameterised queries
+    for blk in @tables
+      if "string" is typeof blk.table
+        p = { "text": "#{blk.table}", "values": [] }
+      else if blk.table instanceof cls.QueryBuilder
+        # building a nested query
+        blk.table.updateOptions( { "nestedBuilder": true } )
+        p = blk.table.toParam()
+      else
+        # building a nested query
+        blk.updateOptions( { "nestedBuilder": true } )
+        p = blk.buildParam(queryBuilder)
+      p.table = blk
+      params.push( p )
+
+    # join the queries and their parameters
+    # this is the last building block processed so always add UNION if there are any UNION blocks
+    for p in params
+      if paramStr isnt ""
+        paramStr += ", "
+      else
+        paramStr += "#{prefix} #{paramStr}" if prefix? and prefix isnt ""
+        paramStr
+      if "string" is typeof p.table.table
+        paramStr += "#{p.text}"
+      else
+        paramStr += "(#{p.text})"
+
+        # add the table alias, the AS keyword is optional
+      paramStr += " #{p.table.alias}" if p.table.alias?
+
+      for v in p.values
+        ret.values.push( @_formatCustomValue v )
+    ret.text += paramStr
+
+    ret
+
+  buildParam: (queryBuilder) ->
+    @_buildParam(queryBuilder)
+
 
 # Update Table
 class cls.UpdateTableBlock extends cls.AbstractTableBlock
   table: (table, alias = null) ->
     @_table(table, alias)
-
-
 
 # FROM table
 class cls.FromTableBlock extends cls.AbstractTableBlock
@@ -584,6 +642,9 @@ class cls.FromTableBlock extends cls.AbstractTableBlock
 
     "FROM #{tables}"
 
+  buildParam: (queryBuilder) ->
+    if 0 >= @tables.length then throw new Error "from() needs to be called"
+    @_buildParam(queryBuilder, "FROM")
 
 
 # INTO table
@@ -769,8 +830,14 @@ class cls.SetFieldBlock extends cls.AbstractSetFieldBlock
       if typeof value is 'undefined'  # e.g. if field is an expression such as: count = count + 1
         str += field
       else
-        str += "#{field} = ?"
-        vals.push @_formatValueAsParam( value )
+        p = @_formatValueAsParam( value )
+        if p.text?
+          str += "#{field} = (#{p.text})"
+          for v in p.values
+            vals.push v
+        else
+          str += "#{field} = ?"
+          vals.push p
 
     { text: "SET #{str}", values: vals }
 
@@ -804,11 +871,18 @@ class cls.InsertFieldValueBlock extends cls.AbstractSetFieldBlock
 
     for i in [0...@values.length]
       for j in [0...@values[i].length]
-        params.push @_formatValueAsParam( @values[i][j] )
-        if 'string' is typeof vals[i]
-          vals[i] += ', ?'
+        p = @_formatValueAsParam( @values[i][j] )
+        if p.text?
+          str = p.text
+          for v in p.values
+            params.push v
         else
-          vals[i] = '?'
+          str = '?'
+          params.push p
+        if 'string' is typeof vals[i]
+          vals[i] += ", #{str}"
+        else
+          vals[i] = "#{str}"
 
     vals: vals
     params: params
@@ -965,10 +1039,20 @@ class cls.WhereBlock extends cls.Block
 
     for where in @wheres
       if "" isnt whereStr then whereStr += ") AND ("
-      whereStr += where.text
+      str = where.text.split('?')
+      i = 0
       for v in where.values
-        ret.values.push( @_formatValueAsParam v )
-        value = @_formatValueAsParam(value)
+        p = @_formatValueAsParam(v)
+        whereStr += "#{str[i]}" if str[i]?
+        if (p.text?)
+          whereStr += "(#{p.text})"
+          for qv in p.values
+            ret.values.push( qv )
+        else
+          whereStr += "?"
+          ret.values.push( p )
+        i = i+1
+      whereStr += "#{str[i]}" if str[i]?
     ret.text = "WHERE (#{whereStr})"
     ret
 
@@ -1094,6 +1178,10 @@ class cls.JoinBlock extends cls.Block
   left_outer_join: (table, alias = null, condition = null) ->
     @join table, alias, condition, 'LEFT OUTER'
 
+  # Add an FULL JOIN with the given table.
+  full_join: (table, alias = null, condition = null) ->
+    @join table, alias, condition, 'FULL'
+
   buildStr: (queryBuilder) ->
     joins = ""
 
@@ -1108,6 +1196,59 @@ class cls.JoinBlock extends cls.Block
       joins += " ON (#{j.condition})" if j.condition
 
     joins
+
+  buildParam: (queryBuilder) ->
+    ret =
+      text: ""
+      values: []
+
+    params = []
+    joinStr = ""
+
+    if 0 >= @joins.length then return ret
+
+    # retrieve the parameterised queries
+    for blk in @joins
+
+      if "string" is typeof blk.table
+        p = { "text": "#{blk.table}", "values": [] }
+      else if blk.table instanceof cls.QueryBuilder
+        # building a nested query
+        blk.table.updateOptions( { "nestedBuilder": true } )
+        p = blk.table.toParam()
+      else
+        # building a nested query
+        blk.updateOptions( { "nestedBuilder": true } )
+        p = blk.buildParam(queryBuilder)
+
+      if blk.condition instanceof cls.Expression
+        cp = blk.condition.toParam()
+        p.condition = cp.text
+        p.values = p.values.concat(cp.values)
+      else
+        p.condition = blk.condition
+
+      p.join = blk
+      params.push( p )
+
+    # join the queries and their parameters
+    # this is the last building block processed so always add UNION if there are any UNION blocks
+    for p in params
+      if joinStr isnt "" then joinStr += " "
+      joinStr += "#{p.join.type} JOIN "
+      if "string" is typeof p.join.table
+        joinStr += p.text
+      else
+        joinStr += "(#{p.text})"
+      joinStr += " #{p.join.alias}" if p.join.alias
+      joinStr += " ON (#{p.condition})" if p.condition
+
+      for v in p.values
+        ret.values.push( @_formatCustomValue v )
+    ret.text += joinStr
+
+    ret
+
 
 # UNION
 class cls.UnionBlock extends cls.Block
@@ -1159,7 +1300,7 @@ class cls.UnionBlock extends cls.Block
     if 0 >= @unions.length then return ret
 
     # retrieve the parameterised queries
-    for blk in @unions
+    for blk in (@unions or [])
       if "string" is typeof blk.table
         p = { "text": "#{blk.table}", "values": [] }
       else if blk.table instanceof cls.QueryBuilder
@@ -1181,7 +1322,6 @@ class cls.UnionBlock extends cls.Block
       for v in p.values
         ret.values.push( @_formatCustomValue v )
     ret.text += unionStr
-
     ret
 
 

@@ -24,14 +24,16 @@ OTHER DEALINGS IN THE SOFTWARE.
 ###
 
 
-squel = require "../squel"
+squel = undefined
 {_, testCreator, assert, expect, should} = require './testbase'
 test = testCreator()
 
 
-
 test['Postgres flavour'] =
-  beforeEach: -> squel.useFlavour 'postgres'
+  beforeEach: ->
+    delete require.cache[require.resolve('../squel')]
+    squel = require "../squel"
+    squel.useFlavour 'postgres'
 
   'INSERT builder':
     beforeEach: -> @inst = squel.insert()
